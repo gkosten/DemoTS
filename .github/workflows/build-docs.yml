@@ -30,13 +30,12 @@ jobs:
       - name: Install Pandoc
         run: sudo apt-get update && sudo apt-get install -y pandoc
 
-      - name: Build ordered file list (Оглавление.md first, then folders by numeric prefix)
+      - name: Build ordered file list
         id: file_list
         env:
           ROOT_DIR: "${{ github.workspace }}"
         run: |
-          # Находим все .md файлы рекурсивно
-          mapfile -t all_files < <(find "$ROOT_DIR" -type f -name '*.md' | sort)
+          mapfile -t all_files < <(find "$ROOT_DIR" -type f -name '*.md' -not -path "*/.git/*" | sort)
 
           ordered_files=()
           has_toc=false
@@ -50,59 +49,44 @@ jobs:
             fi
           done
 
-          # 2. Собираем список папок с числовыми префиксами (например, 01 remote_collection)
-          # Ищем только прямые подпапки корня, у которых имя начинается с цифр
+          # 2. Папки с числовыми префиксами в корне
           mapfile -t dirs < <(find "$ROOT_DIR" -mindepth 1 -maxdepth 1 -type d \
             -exec bash -c '[[ "$(basename "$1")" =~ ^[0-9]+ ]]' _ {} \; \
             | sort)
 
-          # Для каждой папки — сортируем файлы по числовому префиксу
           for dir in "${dirs[@]}"; do
-            dir_name="$(basename "$dir")"
-            # Извлекаем числовой префикс (первые цифры до первого не-цифры или пробела)
-            prefix=$(echo "$dir_name" | grep -oE '^[0-9]+')
-
-            # Находим файлы .md внутри этой папки
             mapfile -t files_in_dir < <(find "$dir" -maxdepth 1 -type f -name '*.md' | sort)
 
-            # Сортируем файлы по их числовому префиксу (например, 01, 02)
-            # Создаём временный массив с парами "префикс файл"
             declare -a paired
             for f in "${files_in_dir[@]}"; do
               fname="$(basename "$f")"
               fprefix=$(echo "$fname" | grep -oE '^[0-9]+')
-              # Если префикса нет — ставим 999, чтобы такие файлы шли в конце папки
               [[ -z "$fprefix" ]] && fprefix=999
               paired+=("$fprefix|$f")
             done
 
-            # Сортируем по префиксу численно
             IFS=$'\n' sorted_paired=($(sort -t'|' -k1,1n <<<"${paired[*]}"))
             unset IFS
 
-            # Добавляем в итоговый список только путь к файлу
             for item in "${sorted_paired[@]}"; do
               file_path="${item#*|}"
               ordered_files+=("$file_path")
             done
           done
 
-          # Если вдруг остались файлы вне пронумерованных папок — добавляем их в конец (по алфавиту)
+          # 3. Остальные файлы (по алфавиту)
           for f in "${all_files[@]}"; do
             skip=false
-            # Проверяем, уже ли добавлен этот файл
             for added in "${ordered_files[@]}"; do
               if [[ "$added" == "$f" ]]; then
                 skip=true
                 break
               fi
             done
-            if [[ "$skip" == false ]]; then
-              ordered_files+=("$f")
-            fi
+            [[ "$skip" == false ]] && ordered_files+=("$f")
           done
 
-          # Формируем строку аргументов для Pandoc с кавычками
+          # Формируем строку аргументов с кавычками
           pandoc_args=""
           for f in "${ordered_files[@]}"; do
             pandoc_args+="\"$f\" "
@@ -118,20 +102,20 @@ jobs:
 
       - name: Convert to DOCX
         run: |
-          FILES=$(find docs -name "*.md" -printf '"%p" ')
+          FILES=${{ steps.file_list.outputs.files }}
+          OUTPUT_FILE="${{ steps.vars.outputs.repo_name }}_${{ steps.vars.outputs.version }}.docx"
 
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$PWD":/data \
-            -w /data \
-            pandoc/core:3.5 \
-              --from gfm \
-              --to docx \
-              --output "${{ steps.vars.outputs.repo_name }}_${{ steps.vars.outputs.version }}.docx" \
-              --toc \
-              --number-sections \
-              --resource-path=. \
-              $FILES
+          echo "Итоговый файл: $OUTPUT_FILE"
+          echo "Количество файлов: ${{ steps.file_list.outputs.count }}"
+
+          eval pandoc \
+            --from gfm \
+            --to docx \
+            --output "\"$OUTPUT_FILE\"" \
+            --toc \
+            --number-sections \
+            --resource-path=. \
+            $FILES
 
       - name: Create or Update Release
         env:
