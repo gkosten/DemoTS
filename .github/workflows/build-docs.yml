@@ -117,23 +117,21 @@ jobs:
           echo "count=${#ordered_files[@]}" >> "$GITHUB_OUTPUT"
 
       - name: Convert to DOCX
-        env:
-          REPO_NAME: ${{ steps.vars.outputs.repo_name }}
-          VERSION: ${{ steps.vars.outputs.version }}
         run: |
-          OUTPUT_FILE="${REPO_NAME}_${VERSION}.docx"
-          FILES=${{ steps.file_list.outputs.files }}
+          FILES=$(find docs -name "*.md" -printf '"%p" ')
 
-          pandoc \
-            --from gfm \
-            --to docx \
-            --output "$OUTPUT_FILE" \
-            --toc \
-            --number-sections \
-            --resource-path=. \
-            $FILES
-
-          ls -lh "$OUTPUT_FILE"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD":/data \
+            -w /data \
+            pandoc/core:3.5 \
+              --from gfm \
+              --to docx \
+              --output "${{ steps.vars.outputs.repo_name }}_${{ steps.vars.outputs.version }}.docx" \
+              --toc \
+              --number-sections \
+              --resource-path=. \
+              $FILES
 
       - name: Create or Update Release
         env:
