@@ -5,126 +5,227 @@ on:
     tags:
       - 'Rel*'
 
+  # Позволяет запустить сборку вручную.
+  workflow_dispatch:
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Extract version and repo name
-        id: vars
+      - name: Install Pandoc, PDF engine and fonts
         run: |
-          TAG="${{ github.ref_name }}"
-          VERSION="${TAG#Rel}"
-          REPO_NAME="${{ github.event.repository.name }}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pandoc \
+            texlive-xetex \
+            texlive-latex-extra \
+            texlive-fonts-recommended \
+            texlive-lang-cyrillic \
+            fonts-dejavu-core
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Install Pandoc
-        run: sudo apt-get update && sudo apt-get install -y pandoc
-
-      - name: Build ordered file list
-        id: file_list
-        env:
-          ROOT_DIR: "${{ github.workspace }}"
+      - name: Build DOCX and PDF
         run: |
-          mapfile -t all_files < <(find "$ROOT_DIR" -type f -name '*.md' -not -path "*/.git/*" | sort)
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
 
-          ordered_files=()
-          has_toc=false
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          os.chdir(root)
 
-          # 1. Первым — Оглавление.md из корня (если есть)
-          for f in "${all_files[@]}"; do
-            if [[ "$(basename "$f")" == "Оглавление.md" ]] && [[ "$(dirname "$f")" == "$ROOT_DIR" ]]; then
-              ordered_files+=("$f")
-              has_toc=true
-              break
-            fi
-          done
+          def natural_key(value):
+              """Естественная сортировка: 2 идёт раньше 10."""
+              parts = re.split(r"(\d+)", str(value))
+              return tuple(
+                  (0, int(part)) if part.isdigit()
+                  else (1, part.casefold())
+                  for part in parts
+              )
 
-          # 2. Папки с числовыми префиксами в корне
-          mapfile -t dirs < <(find "$ROOT_DIR" -mindepth 1 -maxdepth 1 -type d \
-            -exec bash -c '[[ "$(basename "$1")" =~ ^[0-9]+ ]]' _ {} \; \
-            | sort)
+          # Все Markdown-файлы, кроме содержимого .git.
+          all_files = sorted(
+              (
+                  path
+                  for path in root.rglob("*.md")
+                  if path.is_file()
+                  and ".git" not in path.relative_to(root).parts
+              ),
+              key=lambda path: natural_key(
+                  path.relative_to(root).as_posix()
+              ),
+          )
 
-          for dir in "${dirs[@]}"; do
-            mapfile -t files_in_dir < <(find "$dir" -maxdepth 1 -type f -name '*.md' | sort)
+          if not all_files:
+              raise SystemExit(
+                  "В репозитории не найдено ни одного .md-файла."
+              )
 
-            declare -a paired
-            for f in "${files_in_dir[@]}"; do
-              fname="$(basename "$f")"
-              fprefix=$(echo "$fname" | grep -oE '^[0-9]+')
-              [[ -z "$fprefix" ]] && fprefix=999
-              paired+=("$fprefix|$f")
-            done
+          ordered_files = []
+          added = set()
 
-            IFS=$'\n' sorted_paired=($(sort -t'|' -k1,1n <<<"${paired[*]}"))
-            unset IFS
+          def add(path):
+              if path not in added:
+                  ordered_files.append(path)
+                  added.add(path)
 
-            for item in "${sorted_paired[@]}"; do
-              file_path="${item#*|}"
-              ordered_files+=("$file_path")
-            done
-          done
+          # 1. Оглавление.md из корня.
+          toc = root / "Оглавление.md"
+          if toc.is_file():
+              add(toc)
 
-          # 3. Остальные файлы (по алфавиту)
-          for f in "${all_files[@]}"; do
-            skip=false
-            for added in "${ordered_files[@]}"; do
-              if [[ "$added" == "$f" ]]; then
-                skip=true
-                break
-              fi
-            done
-            [[ "$skip" == false ]] && ordered_files+=("$f")
-          done
+          # 2. Корневые каталоги с числовым префиксом:
+          #    1..., 2..., 10...
+          numbered_dirs = sorted(
+              (
+                  path
+                  for path in root.iterdir()
+                  if path.is_dir()
+                  and re.match(r"^\d+", path.name)
+              ),
+              key=lambda path: natural_key(path.name),
+          )
 
-          # Формируем строку аргументов с кавычками
-          pandoc_args=""
-          for f in "${ordered_files[@]}"; do
-            pandoc_args+="\"$f\" "
-          done
+          for directory in numbered_dirs:
+              # Как в исходной задумке: сначала файлы,
+              # лежащие непосредственно в таком каталоге.
+              files = sorted(
+                  (
+                      path
+                      for path in directory.glob("*.md")
+                      if path.is_file()
+                  ),
+                  key=lambda path: natural_key(path.name),
+              )
 
-          if [ -z "$pandoc_args" ]; then
-            echo "::error::No .md files found in the repository."
-            exit 1
-          fi
+              for path in files:
+                  add(path)
 
-          echo "files=$pandoc_args" >> "$GITHUB_OUTPUT"
-          echo "count=${#ordered_files[@]}" >> "$GITHUB_OUTPUT"
+          # 3. Остальные файлы, включая вложенные каталоги.
+          for path in all_files:
+              add(path)
 
-      - name: Convert to DOCX
-        run: |
-          FILES=${{ steps.file_list.outputs.files }}
-          OUTPUT_FILE="${{ steps.vars.outputs.repo_name }}_${{ steps.vars.outputs.version }}.docx"
+          print("Порядок объединения файлов:", flush=True)
+          for index, path in enumerate(ordered_files, start=1):
+              print(
+                  f"{index:3}. {path.relative_to(root)}",
+                  flush=True,
+              )
 
-          echo "Итоговый файл: $OUTPUT_FILE"
-          echo "Количество файлов: ${{ steps.file_list.outputs.count }}"
+          # Pandoc ищет изображения в корне и рядом с Markdown-файлами.
+          resource_dirs = list(
+              dict.fromkeys(
+                  [str(root)]
+                  + [str(path.parent) for path in ordered_files]
+              )
+          )
 
-          eval pandoc \
-            --from gfm \
-            --to docx \
-            --output "\"$OUTPUT_FILE\"" \
-            --toc \
-            --number-sections \
-            --resource-path=. \
-            $FILES
+          repo_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
+          ref_name = os.environ["GITHUB_REF_NAME"]
 
-      - name: Create or Update Release
+          if (
+              os.environ["GITHUB_REF_TYPE"] == "tag"
+              and ref_name.startswith("Rel")
+          ):
+              version = ref_name[len("Rel"):]
+          else:
+              version = ref_name
+
+          # В частности, заменяем "/" в именах тегов или веток.
+          version = re.sub(r"[^\w.-]+", "_", version) or "unversioned"
+          output_base = f"{repo_name}_{version}"
+
+          output_dir = root / "build"
+          output_dir.mkdir(exist_ok=True)
+
+          common_args = [
+              "pandoc",
+              "--from=gfm",
+              "--standalone",
+              "--toc",
+              "--number-sections",
+              "--resource-path=" + os.pathsep.join(resource_dirs),
+          ]
+
+          input_files = [str(path) for path in ordered_files]
+
+          docx_path = output_dir / f"{output_base}.docx"
+          pdf_path = output_dir / f"{output_base}.pdf"
+
+          print(f"\nСоздание {docx_path.name}", flush=True)
+          subprocess.run(
+              common_args
+              + [
+                  "--to=docx",
+                  "--output", str(docx_path),
+              ]
+              + input_files,
+              check=True,
+          )
+
+          print(f"\nСоздание {pdf_path.name}", flush=True)
+          subprocess.run(
+              common_args
+              + [
+                  "--to=pdf",
+                  "--pdf-engine=xelatex",
+                  "--variable", "mainfont=DejaVu Serif",
+                  "--variable", "sansfont=DejaVu Sans",
+                  "--variable", "monofont=DejaVu Sans Mono",
+                  "--variable", "geometry:margin=25mm",
+                  "--variable", "papersize=a4",
+                  "--output", str(pdf_path),
+              ]
+              + input_files,
+              check=True,
+          )
+
+          print("\nГотово:", flush=True)
+          print(docx_path.relative_to(root), flush=True)
+          print(pdf_path.relative_to(root), flush=True)
+          PY
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-documents
+          path: |
+            build/*.docx
+            build/*.pdf
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        # При ручном запуске на ветке сохраняем только артефакты,
+        # но не создаём релиз.
+        if: startsWith(github.ref, 'refs/tags/Rel')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          FILENAME: ${{ steps.vars.outputs.repo_name }}_${{ steps.vars.outputs.version }}.docx
         run: |
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$FILENAME" --clobber --repo "${{ github.repository }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              build/*.docx \
+              build/*.pdf \
+              --clobber
           else
-            gh release create "$TAG" "$FILENAME" --generate-notes --repo "${{ github.repository }}"
+            gh release create "$TAG" \
+              build/*.docx \
+              build/*.pdf \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes
           fi
