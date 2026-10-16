@@ -5,7 +5,7 @@ on:
     tags:
       - 'Rel*'
 
-  # Позволяет запустить сборку вручную.
+  # Ручной запуск из раздела Actions.
   workflow_dispatch:
 
 jobs:
@@ -30,11 +30,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pandoc \
+            lmodern \
             texlive-xetex \
             texlive-latex-extra \
             texlive-fonts-recommended \
             texlive-lang-cyrillic \
             fonts-dejavu-core
+
+          pandoc --version
+          xelatex --version
+          kpsewhich lmodern.sty
 
       - name: Build DOCX and PDF
         run: |
@@ -47,22 +52,30 @@ jobs:
           root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           os.chdir(root)
 
+          output_dir = root / "build"
+
+          def is_source_file(path):
+              """Исключаем служебные файлы и результаты сборки."""
+              parts = path.relative_to(root).parts
+              return (
+                  path.is_file()
+                  and ".git" not in parts
+                  and parts[0] != "build"
+              )
+
           def natural_key(value):
               """Естественная сортировка: 2 идёт раньше 10."""
-              parts = re.split(r"(\d+)", str(value))
               return tuple(
                   (0, int(part)) if part.isdigit()
                   else (1, part.casefold())
-                  for part in parts
+                  for part in re.split(r"(\d+)", str(value))
               )
 
-          # Все Markdown-файлы, кроме содержимого .git.
           all_files = sorted(
               (
                   path
                   for path in root.rglob("*.md")
-                  if path.is_file()
-                  and ".git" not in path.relative_to(root).parts
+                  if is_source_file(path)
               ),
               key=lambda path: natural_key(
                   path.relative_to(root).as_posix()
@@ -82,13 +95,13 @@ jobs:
                   ordered_files.append(path)
                   added.add(path)
 
-          # 1. Оглавление.md из корня.
+          # 1. Первым — Оглавление.md из корня.
           toc = root / "Оглавление.md"
-          if toc.is_file():
+          if toc in all_files:
               add(toc)
 
-          # 2. Корневые каталоги с числовым префиксом:
-          #    1..., 2..., 10...
+          # 2. Файлы непосредственно в корневых каталогах
+          #    с числовыми префиксами: 01..., 02..., 10...
           numbered_dirs = sorted(
               (
                   path
@@ -100,13 +113,11 @@ jobs:
           )
 
           for directory in numbered_dirs:
-              # Как в исходной задумке: сначала файлы,
-              # лежащие непосредственно в таком каталоге.
               files = sorted(
                   (
                       path
-                      for path in directory.glob("*.md")
-                      if path.is_file()
+                      for path in all_files
+                      if path.parent == directory
                   ),
                   key=lambda path: natural_key(path.name),
               )
@@ -114,7 +125,8 @@ jobs:
               for path in files:
                   add(path)
 
-          # 3. Остальные файлы, включая вложенные каталоги.
+          # 3. Все остальные Markdown-файлы,
+          #    в том числе из вложенных каталогов.
           for path in all_files:
               add(path)
 
@@ -125,31 +137,54 @@ jobs:
                   flush=True,
               )
 
-          # Pandoc ищет изображения в корне и рядом с Markdown-файлами.
+          # Ищем изображения также в отдельных каталогах:
+          # images, attachments и других.
+          image_extensions = {
+              ".png", ".jpg", ".jpeg", ".gif",
+              ".svg", ".webp", ".pdf",
+          }
+
+          image_dirs = sorted(
+              {
+                  path.parent
+                  for path in root.rglob("*")
+                  if is_source_file(path)
+                  and path.suffix.lower() in image_extensions
+              },
+              key=lambda path: natural_key(
+                  path.relative_to(root).as_posix()
+              ),
+          )
+
           resource_dirs = list(
               dict.fromkeys(
                   [str(root)]
                   + [str(path.parent) for path in ordered_files]
+                  + [str(directory) for directory in image_dirs]
               )
           )
 
+          print("\nКаталоги поиска изображений:", flush=True)
+          for directory in resource_dirs:
+              print(f"  {directory}", flush=True)
+
           repo_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
           ref_name = os.environ["GITHUB_REF_NAME"]
+          ref_type = os.environ["GITHUB_REF_TYPE"]
 
-          if (
-              os.environ["GITHUB_REF_TYPE"] == "tag"
-              and ref_name.startswith("Rel")
-          ):
+          if ref_type == "tag" and ref_name.startswith("Rel"):
               version = ref_name[len("Rel"):]
           else:
               version = ref_name
 
-          # В частности, заменяем "/" в именах тегов или веток.
+          # Безопасное имя выходных файлов.
           version = re.sub(r"[^\w.-]+", "_", version) or "unversioned"
           output_base = f"{repo_name}_{version}"
 
-          output_dir = root / "build"
           output_dir.mkdir(exist_ok=True)
+
+          docx_path = output_dir / f"{output_base}.docx"
+          pdf_path = output_dir / f"{output_base}.pdf"
 
           common_args = [
               "pandoc",
@@ -160,10 +195,9 @@ jobs:
               "--resource-path=" + os.pathsep.join(resource_dirs),
           ]
 
+          # Каждый путь передаётся отдельным аргументом:
+          # пробелы и кириллица не требуют eval или ручных кавычек.
           input_files = [str(path) for path in ordered_files]
-
-          docx_path = output_dir / f"{output_base}.docx"
-          pdf_path = output_dir / f"{output_base}.pdf"
 
           print(f"\nСоздание {docx_path.name}", flush=True)
           subprocess.run(
@@ -193,12 +227,14 @@ jobs:
               check=True,
           )
 
-          print("\nГотово:", flush=True)
+          print("\nСборка завершена:", flush=True)
           print(docx_path.relative_to(root), flush=True)
           print(pdf_path.relative_to(root), flush=True)
           PY
 
       - name: Upload workflow artifacts
+        # Если PDF не собрался, сохраняем хотя бы готовый DOCX.
+        if: ${{ always() && hashFiles('build/*.docx', 'build/*.pdf') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: compiled-documents
@@ -208,9 +244,9 @@ jobs:
           if-no-files-found: error
 
       - name: Create or update GitHub Release
-        # При ручном запуске на ветке сохраняем только артефакты,
-        # но не создаём релиз.
-        if: startsWith(github.ref, 'refs/tags/Rel')
+        # Релиз публикуем только после успешной сборки
+        # и только для тегов с префиксом Rel.
+        if: ${{ success() && startsWith(github.ref, 'refs/tags/Rel') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
